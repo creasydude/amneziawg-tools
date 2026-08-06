@@ -1,6 +1,8 @@
 name: Linux
-
 on: [push]
+
+permissions:
+  contents: write
 
 jobs:
   Build-for-Ubuntu:
@@ -11,7 +13,6 @@ jobs:
     steps:
     - name: Checkout
       uses: actions/checkout@v4
-
     - name: Build AmneziaWG tools
       run: |
         apt -y update &&
@@ -21,7 +22,6 @@ jobs:
         mkdir build &&
         cp wg ./build/awg &&
         cp wg-quick/linux.bash ./build/awg-quick
-
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
@@ -36,7 +36,6 @@ jobs:
     steps:
     - name: Checkout
       uses: actions/checkout@v4
-
     - name: Build AmneziaWG tools
       run: |
         apt -y update &&
@@ -46,7 +45,6 @@ jobs:
         mkdir build &&
         cp wg ./build/awg &&
         cp wg-quick/linux.bash ./build/awg-quick
-
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
@@ -62,7 +60,6 @@ jobs:
     steps:
     - name: Checkout
       uses: actions/checkout@v4
-
     - name: Build AmneziaWG tools
       run: |
         apt -y update &&
@@ -72,7 +69,6 @@ jobs:
         mkdir build &&
         cp wg ./build/awg &&
         cp wg-quick/linux.bash ./build/awg-quick
-
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
@@ -87,7 +83,6 @@ jobs:
     steps:
     - name: Checkout
       uses: actions/checkout@v4
-
     - name: Build AmneziaWG tools
       run: |
         apk add linux-headers build-base &&
@@ -96,16 +91,67 @@ jobs:
         mkdir build &&
         cp wg ./build/awg &&
         cp wg-quick/linux.bash ./build/awg-quick
-
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
         name: alpine-3.19-amneziawg-tools
         path: ./src/build
 
+  # NEW: figure out, once, whether this run is a real version tag or just a
+  # normal push (e.g. a fork sync / commit to master). For normal pushes we
+  # publish to a single rolling "latest" pre-release and move the "latest"
+  # git tag to point at the new commit, so the release always reflects the
+  # newest push. Runs once (not per-matrix) to avoid race conditions.
+  Prepare-Release:
+    name: Prepare release target
+    needs: [Build-for-Ubuntu, Build-for-Debian, Build-for-Debian-11, Build-for-Alpine]
+    if: github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    outputs:
+      tag_name: ${{ steps.rel.outputs.tag_name }}
+      release_name: ${{ steps.rel.outputs.release_name }}
+      prerelease: ${{ steps.rel.outputs.prerelease }}
+    steps:
+      - name: Determine release tag
+        id: rel
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            echo "tag_name=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+            echo "release_name=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag_name=latest" >> "$GITHUB_OUTPUT"
+            echo "release_name=Latest build ($(date -u +%Y-%m-%d) - ${GITHUB_SHA::7})" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Move "latest" tag to this commit
+        if: steps.rel.outputs.tag_name == 'latest'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            try {
+              await github.rest.git.updateRef({
+                owner, repo,
+                ref: 'tags/latest',
+                sha: context.sha,
+                force: true,
+              });
+            } catch (err) {
+              // Tag doesn't exist yet - create it.
+              await github.rest.git.createRef({
+                owner, repo,
+                ref: 'refs/tags/latest',
+                sha: context.sha,
+              });
+            }
+
   GitHub-Release:
     name: GitHub Release
-    needs: [Build-for-Ubuntu, Build-for-Debian, Build-for-Debian-11, Build-for-Alpine]
+    needs: [Prepare-Release]
+    if: github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/')
     strategy:
       matrix:
         include:
@@ -118,23 +164,22 @@ jobs:
           - os: "alpine"
             release: "3.19"
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v4
-
       - name: Calculate checksums
         run: for file in $(find ./${{ matrix.os }}-${{ matrix.release }}-amneziawg-tools/ -type f); do openssl dgst -sha256 -r "$file" | awk '{print $1}' > "${file}.sha256"; done
-        
+
       - name: Zip files
         run: zip -r ${{ matrix.os }}-${{ matrix.release }}-amneziawg-tools.zip ${{ matrix.os }}-${{ matrix.release }}-amneziawg-tools
-
       - name: Upload binaries to Release
         uses: svenstaro/upload-release-action@v2
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
           file: ./${{ matrix.os }}-${{ matrix.release }}-amneziawg-tools.zip
-          tag: ${{ github.ref }}
-          release_name: ${{ github.ref_name }}
+          tag: ${{ needs.Prepare-Release.outputs.tag_name }}
+          release_name: ${{ needs.Prepare-Release.outputs.release_name }}
+          prerelease: ${{ needs.Prepare-Release.outputs.prerelease }}
+          target_commit: ${{ github.sha }}
           overwrite: true
           file_glob: true
